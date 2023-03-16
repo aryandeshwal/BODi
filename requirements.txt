@@ -1,0 +1,8 @@
+scipy
+numpy
+torch
+gpytorch
+botorch
+cma
+xgboost 
+pandas
