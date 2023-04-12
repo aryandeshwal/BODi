@@ -28,7 +28,12 @@ from gpytorch.priors import GammaPrior
 from gpytorch.utils.warnings import NumericalWarning
 
 from .dictionary_kernel import DictionaryKernel
-from .optimize import optimize_acq_function_mixed_alternating, optimize_acqf_binary_local_search
+from .categorical_dictionary_kernel import DictionaryKernel as CatDictionaryKernel
+from .pestcontrol import PestControl
+
+from .optimize import optimize_acq_function_mixed_alternating, \
+                             optimize_acqf_binary_local_search, \
+                             optimize_acqf_categorical_local_search
 from .test_functions import LABS, SVM, Ackley53, MaxSAT60
 
 
@@ -88,6 +93,7 @@ def _run_single_trial(
     n_binary: int = 0,
     n_categorical: int = 0,
     n_continuous: int = 0,
+    category_size: int = 5,
     init_with_k_spaced_binary_sobol: bool = True,
     n_prototype_vectors: int = 10,
     verbose: bool = False,
@@ -111,6 +117,11 @@ def _run_single_trial(
         assert n_binary == 60, "MaxSAT60 defined for 60 binary variables"
         assert n_categorical == 0, "MaxSAT60 has no categorical parameters"
         assert n_continuous == 0, "MaxSAT60 has no continuous parameters"
+    elif evalfn == "PestControl":
+        f = PestControl(**tkwargs)
+        assert n_categorical == 25, "PestControl defined for 25 categorical variables"
+        assert n_binary == 0, "PestControl defined for 0 binary variables"
+        assert n_continuous == 0, "PestControl defined for 0 continuous variables"
     elif evalfn == "Ackley53":
         f = Ackley53(**tkwargs)
         assert n_binary == 50, "Ackley53 defined for 50 binary variables"
@@ -140,7 +151,9 @@ def _run_single_trial(
     # Rescale the Sobol points
     X = f.bounds[0] + (f.bounds[1] - f.bounds[0]) * X
     X[:, f.binary_inds] = X[:, f.binary_inds].round()  # Round binary variables
-    assert f.n_categorical == 0, "TODO"
+    # assert f.n_categorical == 0, "TODO"
+    if evalfn == "PestControl":
+        X = torch.randint(0, category_size, (n_initial_points, n_categorical), **tkwargs)
     Y = torch.tensor([f(x) for x in X]).to(**tkwargs)
     assert Y.ndim == 2 if evalfn == "SVM" else Y.ndim == 1
 
@@ -156,18 +169,28 @@ def _run_single_trial(
         "add_spray_points": True,
         "n_binary": n_binary,
         "n_cont": n_continuous,
+        "category_size":category_size,
+        "n_categorical":f.n_categorical,
     }
     while len(X) < max_evals:
         likelihood = GaussianLikelihood(
             noise_prior=GammaPrior(torch.tensor(0.9, **tkwargs), torch.tensor(10.0, **tkwargs)),
             noise_constraint=GreaterThan(MIN_INFERRED_NOISE_LEVEL),
         )
-        dictionary_kernel = DictionaryKernel(
-            num_basis_vectors=n_prototype_vectors,
-            binary_dims=f.binary_inds,
-            num_dims=f.dim,
-            similarity=True,
-        )
+        if evalfn == 'PestControl':
+            dictionary_kernel = CatDictionaryKernel(
+                num_basis_vectors=n_prototype_vectors,
+                categorical_dims=f.categorical_dims,
+                num_dims=f.dim,
+                similarity=True,
+            )
+        else:
+            dictionary_kernel = DictionaryKernel(
+                num_basis_vectors=n_prototype_vectors,
+                binary_dims=f.binary_inds,
+                num_dims=f.dim,
+                similarity=True,
+            )
         covar_module = ScaleKernel(
             base_kernel=dictionary_kernel,
             outputscale_prior=GammaPrior(torch.tensor(2.0, **tkwargs), torch.tensor(0.15, **tkwargs)),
@@ -221,6 +244,11 @@ def _run_single_trial(
                 next_x, acq_val = optimize_acq_function_mixed_alternating(
                     acqf, cont_dims=cont_dims, pareto_points=pareto_points, q=batch_size, afo_config=afo_config,
                 )
+            elif n_binary == 0 and n_continuous == 0 and n_categorical > 0:
+                next_x, acq_val = optimize_acqf_categorical_local_search(
+                    acqf, afo_config=afo_config, pareto_points=pareto_points, q=batch_size
+                )
+
 
         X = torch.cat([X, next_x])
         Y = torch.cat([Y, torch.tensor([f(x) for x in next_x], **tkwargs)])
