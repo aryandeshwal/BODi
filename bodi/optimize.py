@@ -1,6 +1,6 @@
 import contextlib
 import os
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, List
 
 import cma
 import numpy as np
@@ -10,6 +10,12 @@ from torch.quasirandom import SobolEngine
 
 from botorch.acquisition import AcquisitionFunction
 from gpytorch.kernels import Kernel, MaternKernel
+
+def convert_to_ohe(x_catg: torch.Tensor, category_sizes):
+    X = []
+    for i in range(len(category_sizes)):
+        X.append(torch.nn.functional.one_hot(x_catg[:, i].long(), num_classes=category_sizes[i]))
+    return torch.hstack(X).to(x_catg)    
 
 
 def get_hamming_neighbors(x_discrete: torch.Tensor):
@@ -295,11 +301,11 @@ def optimize_acqf_binary_local_search(acqf, afo_config, pareto_points: torch.Ten
 
 
 
-def get_catg_neighbors(x_discrete, n_categories,  **tkwargs):
+def get_catg_neighbors(x_discrete, category_sizes,  **tkwargs):
     X_loc = []
     for pt_idx in range(x_discrete.shape[0]):
         for i in range(x_discrete.shape[1]):
-            for j in range(n_categories):
+            for j in range(category_sizes[i]):
                 if x_discrete[pt_idx][i] == j:
                     continue
                 temp_x = x_discrete[pt_idx].clone()
@@ -315,16 +321,21 @@ def optimize_acqf_categorical_local_search(acqf, afo_config, pareto_points: torc
     n_initial_candts = afo_config["n_initial_candts"]  # 2000
     n_restarts = afo_config["n_restarts"]  # 5
     input_dim = afo_config["n_categorical"]
-    n_categories = afo_config["category_size"] # afo_config["n_categories"]
+    # n_categories = afo_config["category_size"] # afo_config["n_categories"]
+    category_sizes = afo_config["category_sizes"] 
 
     for _ in range(q):
         # picking initial points randomly
-        x_init_candts = torch.randint(0, n_categories, (n_initial_candts, input_dim), **tkwargs)
+        X_per_dim = []
+        for i in range(len(category_sizes)):
+            X_per_dim.append(torch.randint(0, category_sizes[i], (1, n_initial_candts), **tkwargs))
+        x_init_candts = torch.cat(X_per_dim).T
+        # x_init_candts = torch.randint(0, n_categories, (n_initial_candts, input_dim), **tkwargs)
         if afo_config["add_spray_points"] is True:
             # append a set of neighbors perturbed from good points evaluated till now
             perturb_nbors = None
             for x in pareto_points:
-                nbds = get_catg_neighbors(x.unsqueeze(0), n_categories, **tkwargs)
+                nbds = get_catg_neighbors(x.unsqueeze(0), category_sizes, **tkwargs)
                 # print(x, nbds)
                 # print(f'nbds {nbds.shape}')
                 if perturb_nbors is None:
@@ -335,7 +346,8 @@ def optimize_acqf_categorical_local_search(acqf, afo_config, pareto_points: torc
             x_init_candts = torch.cat([x_init_candts, perturb_nbors], axis=0)
 
         with torch.no_grad():
-            acq_init_candts = torch.cat([acqf(X_.unsqueeze(1)) for X_ in x_init_candts.split(16)])
+            x_init_candts_ohe = convert_to_ohe(x_catg=x_init_candts, category_sizes=category_sizes)
+            acq_init_candts = torch.cat([acqf(X_.unsqueeze(1)) for X_ in x_init_candts_ohe.split(16)])
         # print(f"x_init_candts {x_init_candts.shape}")
         topk_indices = torch.topk(acq_init_candts, n_restarts)[1]
         # print(f"topk_indices {topk_indices}")
@@ -345,9 +357,10 @@ def optimize_acqf_categorical_local_search(acqf, afo_config, pareto_points: torc
             num_ls_steps = afo_config["num_ls_steps"]  # number of local search steps
             for _ in range(num_ls_steps):
                 # print(f'best_X[i] {best_X[i].shape} {best_X[i].dtype}')
-                nbds = get_catg_neighbors(best_X[i].unsqueeze(0), n_categories, **tkwargs)
+                nbds = get_catg_neighbors(best_X[i].unsqueeze(0), category_sizes, **tkwargs)
                 with torch.no_grad():
-                    acq_vals = acqf(nbds.unsqueeze(1))
+                    nbds_ohe = convert_to_ohe(x_catg=nbds, category_sizes=category_sizes)
+                    acq_vals = acqf(nbds_ohe.unsqueeze(1))
                 if torch.max(acq_vals) > best_acq_val[i]:
                     best_acq_val[i] = torch.max(acq_vals)
                     best_X[i] = nbds[torch.argmax(acq_vals)]
@@ -365,5 +378,6 @@ def optimize_acqf_categorical_local_search(acqf, afo_config, pareto_points: torc
     if q > 1:
         acqf.set_X_pending(base_X_pending)
     with torch.no_grad():
-        acq_value = acqf(candidates.unsqueeze(1)) # compute joint acquisition value
+        candidates_ohe = convert_to_ohe(x_catg=candidates, category_sizes=category_sizes)        
+        acq_value = acqf(candidates_ohe.unsqueeze(1)) # compute joint acquisition value
     return candidates, acq_value
