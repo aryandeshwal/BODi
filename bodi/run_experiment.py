@@ -3,9 +3,10 @@ import pickle
 import time
 import warnings
 from copy import deepcopy
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, List
 
 import torch
+import numpy as np
 from torch import Tensor
 from torch.quasirandom import SobolEngine
 from botorch import fit_gpytorch_model
@@ -33,7 +34,8 @@ from .pestcontrol import PestControl
 
 from .optimize import optimize_acq_function_mixed_alternating, \
                              optimize_acqf_binary_local_search, \
-                             optimize_acqf_categorical_local_search
+                             optimize_acqf_categorical_local_search, \
+                             convert_to_ohe
 from .test_functions import LABS, SVM, Ackley53, MaxSAT60
 
 
@@ -93,7 +95,8 @@ def _run_single_trial(
     n_binary: int = 0,
     n_categorical: int = 0,
     n_continuous: int = 0,
-    category_size: int = 5,
+    category_sizes: List[int] = [],
+    # category_size: int = 5,
     init_with_k_spaced_binary_sobol: bool = True,
     n_prototype_vectors: int = 10,
     verbose: bool = False,
@@ -153,7 +156,12 @@ def _run_single_trial(
     X[:, f.binary_inds] = X[:, f.binary_inds].round()  # Round binary variables
     # assert f.n_categorical == 0, "TODO"
     if evalfn == "PestControl":
-        X = torch.randint(0, category_size, (n_initial_points, n_categorical), **tkwargs)
+        X_per_dim = []
+        for i in range(len(category_sizes)):
+            X_per_dim.append(torch.randint(0, category_sizes[i], (1, n_initial_points), **tkwargs))
+        X = torch.cat(X_per_dim).T
+        X_ohe = convert_to_ohe(X, category_sizes=category_sizes)
+        print(X.shape)
     Y = torch.tensor([f(x) for x in X]).to(**tkwargs)
     assert Y.ndim == 2 if evalfn == "SVM" else Y.ndim == 1
 
@@ -169,7 +177,8 @@ def _run_single_trial(
         "add_spray_points": True,
         "n_binary": n_binary,
         "n_cont": n_continuous,
-        "category_size":category_size,
+        "category_sizes":category_sizes,
+        # "category_size":category_size,
         "n_categorical":f.n_categorical,
     }
     while len(X) < max_evals:
@@ -178,12 +187,18 @@ def _run_single_trial(
             noise_constraint=GreaterThan(MIN_INFERRED_NOISE_LEVEL),
         )
         if evalfn == 'PestControl':
-            dictionary_kernel = CatDictionaryKernel(
+            dictionary_kernel = DictionaryKernel(
                 num_basis_vectors=n_prototype_vectors,
-                categorical_dims=f.categorical_dims,
-                num_dims=f.dim,
+                binary_dims=np.arange(X_ohe.shape[-1]),
+                num_dims=X_ohe.shape[-1],
                 similarity=True,
             )
+            # dictionary_kernel = CatDictionaryKernel(
+            #     num_basis_vectors=n_prototype_vectors,
+            #     categorical_dims=f.categorical_dims,
+            #     num_dims=f.dim,
+            #     similarity=True,
+            # )
         else:
             dictionary_kernel = DictionaryKernel(
                 num_basis_vectors=n_prototype_vectors,
@@ -197,13 +212,22 @@ def _run_single_trial(
             outputscale_constraint=GreaterThan(1e-6)
         )
         train_Y = (Y - Y.mean()) / Y.std() if evalfn != "SVM" else (Y[:, 0] - Y[:, 0].mean()) / Y[:, 0].std()
-        gp_model = SingleTaskGP(
-            train_X=X,
-            train_Y=train_Y.unsqueeze(-1),
-            covar_module=covar_module,
-            input_transform=Normalize(d=X.shape[-1]),
-            likelihood=likelihood,
-        )
+        if evalfn == 'PestControl':
+            gp_model = SingleTaskGP(
+                train_X=X_ohe,
+                train_Y=train_Y.unsqueeze(-1),
+                covar_module=covar_module,
+                input_transform=Normalize(d=X_ohe.shape[-1]),
+                likelihood=likelihood,
+            )
+        else:
+            gp_model = SingleTaskGP(
+                train_X=X,
+                train_Y=train_Y.unsqueeze(-1),
+                covar_module=covar_module,
+                input_transform=Normalize(d=X.shape[-1]),
+                likelihood=likelihood,
+            )
         mll = ExactMarginalLogLikelihood(model=gp_model, likelihood=gp_model.likelihood)
         fit_gpytorch_model(mll)
 
@@ -246,11 +270,12 @@ def _run_single_trial(
                 )
             elif n_binary == 0 and n_continuous == 0 and n_categorical > 0:
                 next_x, acq_val = optimize_acqf_categorical_local_search(
-                    acqf, afo_config=afo_config, pareto_points=pareto_points, q=batch_size
+                    acqf, afo_config=afo_config, pareto_points=pareto_points, q=batch_size,
                 )
 
 
         X = torch.cat([X, next_x])
+        X_ohe = convert_to_ohe(X, category_sizes=category_sizes)
         Y = torch.cat([Y, torch.tensor([f(x) for x in next_x], **tkwargs)])
         if verbose:
             if evalfn == "SVM":
